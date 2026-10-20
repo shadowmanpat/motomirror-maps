@@ -40,6 +40,16 @@ PART_BYTES = 1900 * 1024 * 1024
 MAX_ZOOM = 14
 
 
+# Some servers refuse Python's default user agent, and that failure only shows up
+# on GitHub's runners, not on a Mac. Send an explicit one everywhere.
+USER_AGENT = "motomirror-maps-build/1.0 (+https://github.com/shadowmanpat/motomirror-maps)"
+
+
+def fetch(url, method="GET", timeout=60):
+    request = urllib.request.Request(url, method=method, headers={"User-Agent": USER_AGENT})
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def latest_build():
     """The newest daily build. Old ones are deleted after a few days, so it is
     looked up on every run instead of being written down here."""
@@ -50,10 +60,10 @@ def latest_build():
         day = (today - datetime.timedelta(days=back)).strftime("%Y%m%d")
         url = f"https://build.protomaps.com/{day}.pmtiles"
         try:
-            urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=15)
+            fetch(url, method="HEAD", timeout=15)
             return url
-        except Exception:
-            continue
+        except Exception as error:
+            print(f"  {day}: {error}", file=sys.stderr)
     sys.exit("No daily build found on build.protomaps.com")
 
 
@@ -64,8 +74,7 @@ def boundaries():
 
     The continent is the top of the region's parent chain (`europe`, `asia`…):
     the app lists continents first and countries inside them."""
-    with urllib.request.urlopen("https://download.geofabrik.de/index-v1-nogeom.json",
-                                timeout=60) as response:
+    with fetch("https://download.geofabrik.de/index-v1-nogeom.json") as response:
         features = json.load(response)["features"]
     by_id = {f["properties"]["id"]: f["properties"] for f in features}
 
@@ -222,7 +231,7 @@ def main():
             failed.append(code)
             continue
         poly_url, continent = polys[code]
-        with urllib.request.urlopen(poly_url, timeout=60) as response:
+        with fetch(poly_url) as response:
             region = poly_to_geojson(response.read().decode())
         size = extract(source, code, region, arguments.out, arguments.dry_run)
         if size is None:
