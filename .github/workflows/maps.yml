@@ -22,6 +22,10 @@ on:
 permissions:
   contents: write
 
+# gh needs to know the repository even in jobs that don't check the code out.
+env:
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   setup:
     runs-on: ubuntu-latest
