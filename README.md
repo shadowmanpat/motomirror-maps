@@ -17,15 +17,20 @@ The app reads the catalogue from the latest release:
 
 ## How they are built
 
-The [`Maps`](.github/workflows/maps.yml) workflow runs [`build.py`](build.py) once a month
-(or on "Run workflow"): it cuts each country out of the daily [Protomaps](https://protomaps.com)
-build along its [Geofabrik](https://download.geofabrik.de) border and uploads everything to
-a new release. A release becomes "latest" only once **every** country is uploaded.
+The [`Maps`](.github/workflows/maps.yml) workflow builds the whole world, one job per
+continent, in parallel (GitHub's six-hour limit is per job). Each job cuts its
+countries from the daily [Protomaps](https://protomaps.com) build along their
+[Geofabrik](https://download.geofabrik.de) borders and uploads them to one draft
+release. A final job merges the catalogues and makes the release "latest", so the app
+never sees half a world.
+
+Run it by hand: Actions → **Maps** → Run workflow. Leave the country field empty for the
+whole world, or give codes (`GR IT`) to build just those as a test.
 
 Locally (needs `brew install pmtiles`):
 
-    ./build.py GR CY --out out          # two countries and their catalogue
-    ./build.py --dry-run                # sizes only, every country
+    ./build.py build GR CY --out out                 # two countries and their fragment
+    ./build.py build --continent europe --dry-run    # sizes only, one continent
 
 ## Source and license
 

@@ -1,6 +1,13 @@
 # Builds the country maps and uploads them to a release, on GitHub's machines:
-# ~22 GB each time, which would take hours to upload from a home connection.
-# Free for a public repo. Once a month, or with "Run workflow" for some countries.
+# ~100 GB across the world, which would take days to upload from a home
+# connection. Free for a public repo.
+#
+# Each continent is its own job, running in parallel, because one job would not
+# finish within GitHub's six-hour limit. The last job merges the catalogues and
+# only then makes the release "latest", so the app never sees a partial list.
+#
+# Once a month, or with "Run workflow". Give country codes to build just those
+# (a test): the release is then published with those countries only.
 name: Maps
 
 on:
@@ -9,20 +16,37 @@ on:
   workflow_dispatch:
     inputs:
       countries:
-        description: "Country codes separated by spaces (empty = all)"
+        description: "Country codes separated by spaces (empty = the whole world)"
         default: ""
-      latest:
-        description: "Publish as latest even with only some countries (for testing)"
-        type: boolean
-        default: false
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Tag and draft release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(date -u +%Y-%m-%d)-${{ github.run_number }}
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          gh release create "$tag" --draft --title "Maps $tag" \
+            --notes "Map data © OpenStreetMap contributors, ODbL. Built from the Protomaps daily basemap."
+
+  continent:
+    needs: setup
+    if: inputs.countries == ''
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        continent: [europe, asia, africa, north-america, central-america, south-america, australia-oceania, antarctica]
     steps:
       - uses: actions/checkout@v4
 
@@ -33,15 +57,68 @@ jobs:
             | tar xz -C "$HOME/bin" pmtiles
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Build and upload maps
+      - name: Build ${{ matrix.continent }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 build.py build --continent "${{ matrix.continent }}" --out out --release "${{ needs.setup.outputs.tag }}"
+
+      - name: Keep the catalogue fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: fragment-${{ matrix.continent }}
+          path: out/countries-${{ matrix.continent }}.json
+
+  test:
+    needs: setup
+    if: inputs.countries != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pmtiles
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sfL https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_Linux_x86_64.tar.gz \
+            | tar xz -C "$HOME/bin" pmtiles
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build test countries
         env:
           GH_TOKEN: ${{ github.token }}
           # Passed as a variable, not inside the command: whatever is typed into
           # the field must never become shell code.
           COUNTRIES: ${{ inputs.countries }}
-          LATEST: ${{ inputs.latest }}
+        run: python3 build.py build $COUNTRIES --out out --release "${{ needs.setup.outputs.tag }}"
+
+      - name: Keep the catalogue fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: fragment-test
+          path: out/countries-custom.json
+
+      - name: Publish test release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tag=$(date -u +%Y-%m-%d)-${{ github.run_number }}
-          extra=""
-          if [ "$LATEST" = "true" ]; then extra="--latest"; fi
-          python3 build.py --release "$tag" $extra $COUNTRIES
+          mkdir -p out
+          python3 build.py publish --fragments out --release "${{ needs.setup.outputs.tag }}"
+
+  publish:
+    needs: [setup, continent]
+    if: inputs.countries == ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fragment-*
+          path: out
+          merge-multiple: true
+
+      - name: Publish the whole world as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 build.py publish --fragments out --release "${{ needs.setup.outputs.tag }}"

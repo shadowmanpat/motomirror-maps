@@ -5,10 +5,14 @@ Each country is one PMTiles file up to z14, clipped to the Geofabrik border,
 cut from the daily Protomaps planet build (OpenStreetMap data, ODbL). Nothing
 downloads the planet: `pmtiles extract` reads only the country's byte ranges.
 
-    ./build.py GR CY                     → out/GR.pmtiles, out/CY.pmtiles, out/countries.json
-    ./build.py --dry-run                 → sizes only, for every country
-    ./build.py --release 2026-10-18      → and upload to a release (needs `gh`)
-    ./build.py GR --release t --latest   → a single country, published as latest (for testing)
+The whole world runs as one job per continent (see maps.yml), because one job
+would not finish within GitHub's six-hour limit. Each job writes a catalogue
+fragment; the last job merges them into countries.json.
+
+    ./build.py build --continent europe --release TAG   # one continent
+    ./build.py build GR CY --out out                    # chosen countries
+    ./build.py build --dry-run --continent antarctica   # sizes only
+    ./build.py publish --fragments out --release TAG    # merge and publish
 
 Why clip to the border instead of a bounding box: the box around Greece also
 takes in Izmir, Tirana and Sofia. Measured (19 Oct): 519 MB instead of 272 MB.
@@ -16,7 +20,9 @@ takes in Izmir, Tirana and Sofia. Measured (19 Oct): 519 MB instead of 272 MB.
 Needs `pmtiles` (brew install pmtiles) and, for uploads, `gh`.
 """
 import argparse
+import collections
 import datetime
+import glob
 import json
 import os
 import re
@@ -25,10 +31,13 @@ import sys
 import tempfile
 import urllib.request
 
-# The app's countries (`MapRegion.all`). The app lists whatever `countries.json`
-# says, so a country missing here simply doesn't show up.
-COUNTRIES = ("GR AL MK BG RS ME BA HR SI RO TR IT AT CH DE FR ES PT CZ SK HU PL NL "
-             "BE GB IE DK SE NO FI EE LV LT UA MD CY MT").split()
+INDEX_URL = "https://download.geofabrik.de/index-v1-nogeom.json"
+
+# The continents the app lists, in the order it shows them. Geofabrik files
+# Russia under its own top-level region; it is counted as Europe here.
+CONTINENTS = ["europe", "asia", "africa", "north-america", "central-america",
+              "south-america", "australia-oceania", "antarctica"]
+CONTINENT_ALIAS = {"russia": "europe"}
 
 # GitHub rejects release files over 2 GiB. Germany and France are 2.5 GB each
 # (measured 19 Oct), so they are split into parts that the app joins again.
@@ -39,9 +48,8 @@ PART_BYTES = 1900 * 1024 * 1024
 # doubles the file (measured: 519 → 983 MB for the box around Greece).
 MAX_ZOOM = 14
 
-
-# Some servers refuse Python's default user agent, and that failure only shows up
-# on GitHub's runners, not on a Mac. Send an explicit one everywhere.
+# Some servers refuse Python's default user agent, and that failure only shows
+# on GitHub's runners, never on a Mac. Every request names itself.
 USER_AGENT = "motomirror-maps-build/1.0 (+https://github.com/shadowmanpat/motomirror-maps)"
 
 
@@ -67,31 +75,35 @@ def latest_build():
     sys.exit("No daily build found on build.protomaps.com")
 
 
-def boundaries():
-    """Country code → (border .poly URL, continent) from the Geofabrik index.
-    Picks the region that is **only** that country (not "Ireland and Northern
-    Ireland" for GB), and the country itself, not one of its provinces.
+def countries():
+    """Every country with a region of its own, from the Geofabrik index.
 
-    The continent is the top of the region's parent chain (`europe`, `asia`…):
-    the app lists continents first and countries inside them."""
-    with fetch("https://download.geofabrik.de/index-v1-nogeom.json") as response:
+    Returns code → {"poly": border URL, "continent": name}. Regions shared by
+    several countries (the Gulf states, Israel and Palestine…) are left out:
+    cutting one would give every country the whole shared border."""
+    with fetch(INDEX_URL) as response:
         features = json.load(response)["features"]
-    by_id = {f["properties"]["id"]: f["properties"] for f in features}
+    by_id = {feature["properties"]["id"]: feature["properties"] for feature in features}
 
     def continent(region):
         while region.get("parent") in by_id:
             region = by_id[region["parent"]]
-        return region["id"]
+        return CONTINENT_ALIAS.get(region["id"], region["id"])
+
+    grouped = collections.defaultdict(list)
+    for feature in features:
+        properties = feature["properties"]
+        codes = properties.get("iso3166-1:alpha2") or []
+        if len(codes) == 1:
+            grouped[codes[0]].append(properties)
 
     found = {}
-    for code in COUNTRIES:
-        matches = [f["properties"] for f in features
-                   if f["properties"].get("iso3166-1:alpha2") == [code]]
-        ids = {m["id"] for m in matches}
-        top = [m for m in matches if m.get("parent") not in ids] or matches
-        if top:
-            found[code] = (top[0]["urls"]["pbf"].replace("-latest.osm.pbf", ".poly"),
-                           continent(top[0]))
+    for code, regions in grouped.items():
+        ids = {region["id"] for region in regions}
+        # The country itself, not one of its provinces.
+        top = [region for region in regions if region.get("parent") not in ids] or regions
+        found[code] = {"poly": top[0]["urls"]["pbf"].replace("-latest.osm.pbf", ".poly"),
+                       "continent": continent(top[0])}
     return found
 
 
@@ -180,90 +192,114 @@ def split(path):
 
 
 def upload(tag, files, out):
-    """Uploads, then deletes: the GitHub runner has ~14 GB free, and all the
-    countries together are ~22 GB."""
+    """Uploads, then deletes: each runner has ~14 GB free, and a continent can
+    be tens of GB in total."""
     paths = [os.path.join(out, name) for name in files]
     subprocess.run(["gh", "release", "upload", tag, "--clobber"] + paths, check=True)
     for path in paths:
         os.unlink(path)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("codes", nargs="*", help="country codes (empty = all)")
-    parser.add_argument("--out", default="out")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--release", help="release tag to upload to")
-    parser.add_argument("--part-mb", type=int,
-                        help="part size in MB (to test joining parts in the app)")
-    parser.add_argument("--latest", action="store_true",
-                        help="publish as latest even if not every country is built "
-                             "(for testing one country in the app)")
-    arguments = parser.parse_args()
+def build(arguments):
+    index = countries()
+    if arguments.continent:
+        if arguments.continent not in CONTINENTS:
+            sys.exit(f"Unknown continent: {arguments.continent}")
+        codes = sorted(code for code, info in index.items()
+                       if info["continent"] == arguments.continent)
+        label = arguments.continent
+    else:
+        codes = [code.upper() for code in arguments.codes]
+        label = "custom"
+    unknown = [code for code in codes if code not in index]
+    if unknown:
+        sys.exit(f"Not in Geofabrik: {' '.join(unknown)}")
 
-    codes = [code.upper() for code in arguments.codes] or COUNTRIES
-    if arguments.part_mb:
-        global PART_BYTES
-        PART_BYTES = arguments.part_mb * 1024 * 1024
     os.makedirs(arguments.out, exist_ok=True)
     source = latest_build()
     built_on = re.search(r"(\d{8})\.pmtiles$", source)
     date = (datetime.datetime.strptime(built_on.group(1), "%Y%m%d").date().isoformat()
             if built_on else datetime.date.today().isoformat())
-    print(f"▸ source {source}")
-    polys = boundaries()
+    print(f"▸ {label}: {len(codes)} countries from {source}", flush=True)
 
-    tag = arguments.release
-    if tag:
-        # A draft until everything is uploaded: "latest" only moves when the new
-        # catalogue is complete, never halfway through.
-        subprocess.run(["gh", "release", "create", tag, "--draft", "--title", f"Maps {date}",
-                        "--notes", "Map data © OpenStreetMap contributors, ODbL. "
-                                   "Built from the Protomaps daily basemap."],
-                       capture_output=True)
-
-    catalogue = {"version": 1, "tag": tag or date, "date": date, "countries": {}}
+    catalogue = {"version": 1, "tag": arguments.release or date, "date": date,
+                 "countries": {}}
     failed = []
     for code in codes:
-        if code not in polys:
-            print(f"✗ {code}: not in Geofabrik", file=sys.stderr)
-            failed.append(code)
-            continue
-        poly_url, continent = polys[code]
-        with fetch(poly_url) as response:
-            region = poly_to_geojson(response.read().decode())
+        region = poly_to_geojson(fetch(index[code]["poly"]).read().decode())
         size = extract(source, code, region, arguments.out, arguments.dry_run)
         if size is None:
-            print(f"✗ {code}: failed", file=sys.stderr)
+            print(f"✗ {code}: failed", file=sys.stderr, flush=True)
             failed.append(code)
             continue
         print(f"✓ {code} {size / 1e6:.0f} MB", flush=True)
-        entry = {"bytes": size, "continent": continent, "bounds": bounds(region)}
+        entry = {"bytes": size, "continent": index[code]["continent"],
+                 "bounds": bounds(region)}
         if arguments.dry_run:
             catalogue["countries"][code] = dict(entry, parts=[])
             continue
         parts = split(os.path.join(arguments.out, f"{code}.pmtiles"))
         catalogue["countries"][code] = dict(entry, parts=parts)
-        if tag:
-            upload(tag, parts, arguments.out)
+        if arguments.release:
+            upload(arguments.release, parts, arguments.out)
 
-    path = os.path.join(arguments.out, "countries.json")
-    with open(path, "w") as handle:
+    fragment = os.path.join(arguments.out, f"countries-{label}.json")
+    with open(fragment, "w") as handle:
         json.dump(catalogue, handle, indent=1, sort_keys=True)
     total = sum(country["bytes"] for country in catalogue["countries"].values())
-    print(f"▸ {len(catalogue['countries'])} countries, {total / 1e9:.1f} GB")
-    if tag and not arguments.dry_run:
-        subprocess.run(["gh", "release", "upload", tag, "--clobber", path], check=True)
-        # "latest" only with **all** countries: the app lists what the catalogue
-        # says, and a release with just Cyprus would hide all the others. Unless
-        # asked for, to try one country in the app before the full build.
-        if not failed and (set(codes) == set(COUNTRIES) or arguments.latest):
-            subprocess.run(["gh", "release", "edit", tag, "--draft=false", "--latest"], check=True)
-        else:
-            print("▸ partial build: the release stays a draft")
+    print(f"▸ {label}: {len(catalogue['countries'])} countries, {total / 1e9:.1f} GB")
     if failed:
         sys.exit(f"Failed: {' '.join(failed)}")
+
+
+def publish(arguments):
+    """Merges the fragments of every continent and makes the release the latest.
+
+    Only runs after every continent job succeeded (see maps.yml), so "latest"
+    never shows a partial catalogue."""
+    merged = {"version": 1, "tag": arguments.release, "date": None, "countries": {}}
+    for path in sorted(glob.glob(os.path.join(arguments.fragments, "countries-*.json"))):
+        with open(path) as handle:
+            fragment = json.load(handle)
+        merged["date"] = merged["date"] or fragment["date"]
+        merged["countries"].update(fragment["countries"])
+    if not merged["countries"]:
+        sys.exit("No countries in any fragment")
+    out = os.path.join(arguments.fragments, "countries.json")
+    with open(out, "w") as handle:
+        json.dump(merged, handle, indent=1, sort_keys=True)
+    print(f"▸ {len(merged['countries'])} countries in the catalogue")
+    subprocess.run(["gh", "release", "upload", arguments.release, "--clobber", out], check=True)
+    subprocess.run(["gh", "release", "edit", arguments.release, "--draft=false", "--latest"],
+                   check=True)
+
+
+def main():
+    global PART_BYTES
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    cut = commands.add_parser("build", help="cut countries and write a catalogue fragment")
+    cut.add_argument("codes", nargs="*", help="country codes (or use --continent)")
+    cut.add_argument("--continent", help="every country of one continent")
+    cut.add_argument("--out", default="out")
+    cut.add_argument("--dry-run", action="store_true")
+    cut.add_argument("--release", help="release tag to upload parts to")
+    cut.add_argument("--part-mb", type=int,
+                     help="part size in MB (to test joining parts in the app)")
+
+    join = commands.add_parser("publish", help="merge fragments and publish as latest")
+    join.add_argument("--fragments", default="out")
+    join.add_argument("--release", required=True)
+
+    arguments = parser.parse_args()
+    if arguments.command == "build":
+        if arguments.part_mb:
+            PART_BYTES = arguments.part_mb * 1024 * 1024
+        build(arguments)
+    else:
+        publish(arguments)
 
 
 if __name__ == "__main__":
