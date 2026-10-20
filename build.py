@@ -8,6 +8,7 @@ downloads the planet: `pmtiles extract` reads only the country's byte ranges.
     ./build.py GR CY                     → out/GR.pmtiles, out/CY.pmtiles, out/countries.json
     ./build.py --dry-run                 → sizes only, for every country
     ./build.py --release 2026-10-18      → and upload to a release (needs `gh`)
+    ./build.py GR --release t --latest   → a single country, published as latest (for testing)
 
 Why clip to the border instead of a bounding box: the box around Greece also
 takes in Izmir, Tirana and Sofia. Measured (19 Oct): 519 MB instead of 272 MB.
@@ -57,12 +58,22 @@ def latest_build():
 
 
 def boundaries():
-    """Country code → border (.poly) from the Geofabrik index. Picks the region
-    that is **only** that country (not "Ireland and Northern Ireland" for GB),
-    and the country itself, not one of its provinces."""
+    """Country code → (border .poly URL, continent) from the Geofabrik index.
+    Picks the region that is **only** that country (not "Ireland and Northern
+    Ireland" for GB), and the country itself, not one of its provinces.
+
+    The continent is the top of the region's parent chain (`europe`, `asia`…):
+    the app lists continents first and countries inside them."""
     with urllib.request.urlopen("https://download.geofabrik.de/index-v1-nogeom.json",
                                 timeout=60) as response:
         features = json.load(response)["features"]
+    by_id = {f["properties"]["id"]: f["properties"] for f in features}
+
+    def continent(region):
+        while region.get("parent") in by_id:
+            region = by_id[region["parent"]]
+        return region["id"]
+
     found = {}
     for code in COUNTRIES:
         matches = [f["properties"] for f in features
@@ -70,7 +81,8 @@ def boundaries():
         ids = {m["id"] for m in matches}
         top = [m for m in matches if m.get("parent") not in ids] or matches
         if top:
-            found[code] = top[0]["urls"]["pbf"].replace("-latest.osm.pbf", ".poly")
+            found[code] = (top[0]["urls"]["pbf"].replace("-latest.osm.pbf", ".poly"),
+                           continent(top[0]))
     return found
 
 
@@ -99,10 +111,16 @@ def poly_to_geojson(text):
     return {"type": "MultiPolygon", "coordinates": polygons}
 
 
-def extract(source, code, poly_url, out, dry_run):
+def bounds(region):
+    """[west, south, east, north] of the border, so the app can tell which
+    countries are around the rider before any of them is downloaded."""
+    points = [point for polygon in region["coordinates"] for point in polygon[0]]
+    return [round(min(p[0] for p in points), 3), round(min(p[1] for p in points), 3),
+            round(max(p[0] for p in points), 3), round(max(p[1] for p in points), 3)]
+
+
+def extract(source, code, region, out, dry_run):
     """Cuts one country. Returns its size in bytes (an estimate with `dry_run`)."""
-    with urllib.request.urlopen(poly_url, timeout=60) as response:
-        region = poly_to_geojson(response.read().decode())
     with tempfile.NamedTemporaryFile("w", suffix=".geojson", delete=False) as handle:
         json.dump(region, handle)
         region_path = handle.name
@@ -170,6 +188,9 @@ def main():
     parser.add_argument("--release", help="release tag to upload to")
     parser.add_argument("--part-mb", type=int,
                         help="part size in MB (to test joining parts in the app)")
+    parser.add_argument("--latest", action="store_true",
+                        help="publish as latest even if not every country is built "
+                             "(for testing one country in the app)")
     arguments = parser.parse_args()
 
     codes = [code.upper() for code in arguments.codes] or COUNTRIES
@@ -200,17 +221,21 @@ def main():
             print(f"✗ {code}: not in Geofabrik", file=sys.stderr)
             failed.append(code)
             continue
-        size = extract(source, code, polys[code], arguments.out, arguments.dry_run)
+        poly_url, continent = polys[code]
+        with urllib.request.urlopen(poly_url, timeout=60) as response:
+            region = poly_to_geojson(response.read().decode())
+        size = extract(source, code, region, arguments.out, arguments.dry_run)
         if size is None:
             print(f"✗ {code}: failed", file=sys.stderr)
             failed.append(code)
             continue
         print(f"✓ {code} {size / 1e6:.0f} MB", flush=True)
+        entry = {"bytes": size, "continent": continent, "bounds": bounds(region)}
         if arguments.dry_run:
-            catalogue["countries"][code] = {"bytes": size, "parts": []}
+            catalogue["countries"][code] = dict(entry, parts=[])
             continue
         parts = split(os.path.join(arguments.out, f"{code}.pmtiles"))
-        catalogue["countries"][code] = {"bytes": size, "parts": parts}
+        catalogue["countries"][code] = dict(entry, parts=parts)
         if tag:
             upload(tag, parts, arguments.out)
 
@@ -222,8 +247,9 @@ def main():
     if tag and not arguments.dry_run:
         subprocess.run(["gh", "release", "upload", tag, "--clobber", path], check=True)
         # "latest" only with **all** countries: the app lists what the catalogue
-        # says, and a release with just Cyprus would hide all the others.
-        if not failed and set(codes) == set(COUNTRIES):
+        # says, and a release with just Cyprus would hide all the others. Unless
+        # asked for, to try one country in the app before the full build.
+        if not failed and (set(codes) == set(COUNTRIES) or arguments.latest):
             subprocess.run(["gh", "release", "edit", tag, "--draft=false", "--latest"], check=True)
         else:
             print("▸ partial build: the release stays a draft")

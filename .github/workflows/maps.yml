@@ -11,6 +11,10 @@ on:
       countries:
         description: "Country codes separated by spaces (empty = all)"
         default: ""
+      latest:
+        description: "Publish as latest even with only some countries (for testing)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,6 +39,9 @@ jobs:
           # Passed as a variable, not inside the command: whatever is typed into
           # the field must never become shell code.
           COUNTRIES: ${{ inputs.countries }}
+          LATEST: ${{ inputs.latest }}
         run: |
           tag=$(date -u +%Y-%m-%d)-${{ github.run_number }}
-          python3 build.py --release "$tag" $COUNTRIES
+          extra=""
+          if [ "$LATEST" = "true" ]; then extra="--latest"; fi
+          python3 build.py --release "$tag" $extra $COUNTRIES
